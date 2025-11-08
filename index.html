@@ -1,9 +1,605 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <script>
-        window.location.href = "upi://pay?pa=myntra.payu@icici&pn=ROHIT KUMAR GUPTA&tr=25882703714&tid=PPPL258827037140411251619486909da4c&am=10.12&cu=INR&tn=UPIIntent";
-    </script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SMS Plus - UPI Payment Assistant</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 </head>
-</html>
+<body class="bg-gray-100 min-h-screen">
+    <div id="root"></div>
 
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // Configuration
+        const PROXY_BASE_URL = 'https://agentic-upi.onrender.com';
+        const MCP_URL = `${PROXY_BASE_URL}/messages`;
+        const CLAUDE_URL = `${PROXY_BASE_URL}/claude`;
+        const SSE_URL = `${PROXY_BASE_URL}/sse`;
+
+        function App() {
+            // State management
+            const [mcpServers, setMcpServers] = useState([]);
+            const [messages, setMessages] = useState([]);
+            const [inputValue, setInputValue] = useState('');
+            const [connectionStatus, setConnectionStatus] = useState('disconnected');
+            const [debugLogs, setDebugLogs] = useState([]);
+            const [isDebugVisible, setIsDebugVisible] = useState(true);
+            const [isLoading, setIsLoading] = useState(false);
+            const [messageCounter, setMessageCounter] = useState(0);
+            const [pendingPayments, setPendingPayments] = useState(new Map());
+
+            // Refs
+            const clientId = useRef(`client_${Math.random().toString(36).substr(2, 9)}`);
+            const sseConnection = useRef(null);
+
+            // Generate unique message ID
+            const generateMessageId = () => {
+                const counter = messageCounter;
+                setMessageCounter(prev => prev + 1);
+                return `msg_${Date.now()}_${counter}`;
+            };
+
+            // Debug logging function
+            const addDebugLog = (level, message, data = null) => {
+                const timestamp = new Date().toLocaleTimeString();
+                const logEntry = {
+                    id: `log_${Date.now()}_${Math.random()}`,
+                    timestamp,
+                    level,
+                    message,
+                    data
+                };
+                
+                setDebugLogs(prev => [...prev.slice(-49), logEntry]);
+                console.log(`[${timestamp}] ${level}: ${message}`, data || '');
+            };
+
+            // Initialize MCP connection
+            const connectToMCP = async (serverName, url) => {
+                try {
+                    addDebugLog('INFO', `Connecting to MCP server: ${serverName}`);
+                    setConnectionStatus('connecting');
+
+                    // Step 1: Initialize MCP session
+                    addDebugLog('INFO', 'Step 1: Initializing MCP session...');
+                    const initResponse = await sendMCPMessage({
+                        jsonrpc: "2.0",
+                        id: 1,
+                        method: "initialize",
+                        params: {
+                            protocolVersion: "2024-11-05",
+                            capabilities: {
+                                experimental: {},
+                                sampling: {}
+                            },
+                            clientInfo: {
+                                name: "Airtel AI Commerce",
+                                version: "1.0.0"
+                            }
+                        }
+                    });
+
+                    if (initResponse) {
+                        addDebugLog('SUCCESS', 'Session initialization request sent');
+                        
+                        // Step 2: Establish SSE connection
+                        addDebugLog('INFO', 'Step 2: Establishing SSE connection...');
+                        await establishSSEConnection();
+                        
+                        // Step 3: Send initialized notification
+                        setTimeout(() => {
+                            addDebugLog('INFO', 'Sending initialized notification...');
+                            sendMCPMessage({
+                                jsonrpc: "2.0",
+                                method: "notifications/initialized"
+                            });
+                        }, 1000);
+
+                        // Step 4: Request tools list
+                        setTimeout(() => {
+                            addDebugLog('INFO', 'Requesting tools list...');
+                            sendMCPMessage({
+                                jsonrpc: "2.0",
+                                id: 2,
+                                method: "tools/list"
+                            });
+                        }, 2000);
+
+                        setConnectionStatus('connected');
+                        addDebugLog('SUCCESS', `Connected to MCP server: ${serverName}`);
+                    }
+                } catch (error) {
+                    addDebugLog('ERROR', `Failed to connect to MCP server: ${error.message}`);
+                    setConnectionStatus('error');
+                }
+            };
+
+            // Send MCP message through proxy
+            const sendMCPMessage = async (message) => {
+                try {
+                    addDebugLog('INFO', `Sending MCP message: ${message.method}`, message);
+
+                    const response = await fetch(MCP_URL, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json, text/event-stream',
+                            'x-client-id': clientId.current
+                        },
+                        body: JSON.stringify(message)
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+
+                    addDebugLog('DEBUG', 'MCP message sent, response via SSE expected');
+                    return true;
+
+                } catch (error) {
+                    addDebugLog('ERROR', `MCP message failed: ${error.message}`);
+                    throw error;
+                }
+            };
+
+            // Establish SSE connection with enhanced payment handling
+            const establishSSEConnection = () => {
+                return new Promise((resolve, reject) => {
+                    try {
+                        addDebugLog('INFO', 'Establishing SSE connection...');
+                        
+                        if (sseConnection.current) {
+                            sseConnection.current.close();
+                            sseConnection.current = null;
+                        }
+                        
+                        sseConnection.current = new EventSource(`${SSE_URL}?x-client-id=${clientId.current}`);
+                        
+                        const connectionTimeout = setTimeout(() => {
+                            addDebugLog('ERROR', 'SSE connection timeout');
+                            if (sseConnection.current) {
+                                sseConnection.current.close();
+                            }
+                            reject(new Error('SSE connection timeout'));
+                        }, 15000);
+
+                        sseConnection.current.onopen = () => {
+                            clearTimeout(connectionTimeout);
+                            addDebugLog('SUCCESS', 'SSE connection established successfully');
+                            resolve();
+                        };
+
+                        sseConnection.current.onmessage = (event) => {
+                            try {
+                                const data = JSON.parse(event.data);
+                                addDebugLog('MCP', `< ${data.result ? 'response' : 'notification'} for ${clientId.current}`, data);
+                                
+                                if (data.result && data.result.tools) {
+                                    addDebugLog('SUCCESS', `Found ${data.result.tools.length} tools available`);
+                                }
+                            } catch (error) {
+                                addDebugLog('DEBUG', 'Received SSE message', event.data);
+                            }
+                        };
+
+                        // Listen for custom payment events
+                        sseConnection.current.addEventListener('payment_ready', (event) => {
+                            try {
+                                const paymentData = JSON.parse(event.data);
+                                addDebugLog('PAYMENT', 'Payment ready event received!', paymentData);
+                                handlePaymentReady(paymentData.data);
+                            } catch (error) {
+                                addDebugLog('ERROR', 'Failed to parse payment event', error);
+                            }
+                        });
+
+                        sseConnection.current.onerror = (error) => {
+                            clearTimeout(connectionTimeout);
+                            addDebugLog('ERROR', 'SSE connection error', error);
+                            // Don't reject here, allow connection to continue
+                            resolve();
+                        };
+
+                    } catch (error) {
+                        addDebugLog('ERROR', `SSE setup failed: ${error.message}`);
+                        reject(error);
+                    }
+                });
+            };
+
+            // Handle payment ready event from SSE
+            const handlePaymentReady = (paymentData) => {
+                addDebugLog('SUCCESS', 'Processing payment ready data', paymentData);
+                
+                // Find the pending payment message and update it
+                setMessages(prevMessages => {
+                    return prevMessages.map(message => {
+                        // Look for pending payment messages
+                        if (message.content && message.content.includes('Processing payment request')) {
+                            // Update the message with payment button
+                            return {
+                                ...message,
+                                content: `✅ Payment of Rs ${paymentData.amount} is ready!\n\n💳 Transaction Details:\n• Reference ID: ${paymentData.referenceId}\n• Transaction ID: ${paymentData.txnId}\n\nClick the button below to complete your payment:`,
+                                paymentButton: {
+                                    text: `Pay Rs ${paymentData.amount}`,
+                                    url: paymentData.intentURIData,
+                                    type: 'payment',
+                                    referenceId: paymentData.referenceId,
+                                    txnId: paymentData.txnId
+                                }
+                            };
+                        }
+                        return message;
+                    });
+                });
+                
+                // Add success message
+                addDebugLog('SUCCESS', `Payment button created for Rs ${paymentData.amount}`);
+            };
+
+            // Process message with enhanced AI
+            const processMessage = async (prompt) => {
+                try {
+                    addDebugLog('INFO', 'Processing input with enhanced AI...');
+
+                    const response = await fetch(CLAUDE_URL, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'x-client-id': clientId.current
+                        },
+                        body: JSON.stringify({
+                            messages: [
+                                {
+                                    role: 'user',
+                                    content: prompt
+                                }
+                            ]
+                        })
+                    });
+
+                    if (!response.ok) {
+                        const errorData = await response.text();
+                        throw new Error(`AI processing error: ${response.status} - ${errorData}`);
+                    }
+
+                    const data = await response.json();
+                    addDebugLog('SUCCESS', 'AI response received', data);
+                    
+                    return data;
+
+                } catch (error) {
+                    addDebugLog('ERROR', 'AI processing failed', error.message);
+                    throw error;
+                }
+            };
+
+            // Handle payment button click
+            const handlePaymentClick = (url) => {
+                addDebugLog('INFO', `Opening payment URL: ${url}`);
+                
+                // Open payment URL in new window/tab
+                window.open(url, '_blank');
+                
+                // Show success message in chat
+                setMessages(prev => [...prev, {
+                    id: generateMessageId(),
+                    type: 'system',
+                    content: '🔗 Payment link opened! Complete the payment in the new tab.',
+                    timestamp: new Date().toLocaleTimeString()
+                }]);
+            };
+
+            // Handle message submission
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                if (!inputValue.trim() || isLoading) return;
+
+                const userMessage = inputValue.trim();
+                setInputValue('');
+                setIsLoading(true);
+
+                // Add user message to chat
+                setMessages(prev => [...prev, {
+                    id: generateMessageId(),
+                    type: 'user',
+                    content: userMessage,
+                    timestamp: new Date().toLocaleTimeString()
+                }]);
+
+                try {
+                    // Process with enhanced AI
+                    const response = await processMessage(userMessage);
+                    
+                    // Add AI response to chat
+                    const aiMessage = {
+                        id: generateMessageId(),
+                        type: 'assistant',
+                        content: response.content[0].text,
+                        timestamp: new Date().toLocaleTimeString()
+                    };
+                    
+                    // If this is a pending payment, mark it
+                    if (response.pendingPayment) {
+                        aiMessage.pendingPayment = true;
+                        aiMessage.amount = response.amount;
+                        addDebugLog('INFO', `Pending payment for Rs ${response.amount}, waiting for SSE...`);
+                    }
+                    
+                    // Add payment button if present (for non-async responses)
+                    if (response.paymentButton) {
+                        aiMessage.paymentButton = response.paymentButton;
+                        addDebugLog('SUCCESS', 'Payment button received', response.paymentButton);
+                    }
+                    
+                    setMessages(prev => [...prev, aiMessage]);
+                    addDebugLog('SUCCESS', 'Message processing completed');
+
+                } catch (error) {
+                    addDebugLog('ERROR', 'Message processing failed', error.message);
+                    
+                    // Add error message to chat
+                    setMessages(prev => [...prev, {
+                        id: generateMessageId(),
+                        type: 'error',
+                        content: `Error: ${error.message}`,
+                        timestamp: new Date().toLocaleTimeString()
+                    }]);
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+
+            // Add MCP server
+            const addMCPServer = () => {
+                const serverName = 'UPI PayU';
+                const serverUrl = 'https://uatoneapi.payu.in';
+                
+                setMcpServers(prev => [...prev, { 
+                    id: `server_${Date.now()}`, 
+                    name: serverName, 
+                    url: serverUrl 
+                }]);
+                
+                addDebugLog('INFO', `Added MCP server: ${serverName} at ${serverUrl}`);
+                connectToMCP(serverName, serverUrl);
+            };
+
+            // Auto-add MCP server on component mount
+            useEffect(() => {
+                if (mcpServers.length === 0) {
+                    addMCPServer();
+                }
+            }, []);
+
+            // Cleanup on unmount
+            useEffect(() => {
+                return () => {
+                    if (sseConnection.current) {
+                        sseConnection.current.close();
+                    }
+                };
+            }, []);
+
+            // Render payment button component
+            const PaymentButton = ({ button }) => (
+                <div className="mt-3">
+                    <button
+                        onClick={() => handlePaymentClick(button.url)}
+                        className="bg-gradient-to-r from-green-600 to-green-700 hover:from-green-700 hover:to-green-800 text-white font-semibold py-3 px-6 rounded-lg shadow-lg transition-all duration-200 flex items-center space-x-2 transform hover:scale-105 animate-pulse"
+                        type="button"
+                    >
+                        <span>💳</span>
+                        <span>{button.text}</span>
+                        <span>🚀</span>
+                    </button>
+                    <p className="text-xs text-gray-500 mt-2">
+                        Secure UPI payment • Ref: {button.referenceId || 'N/A'}
+                    </p>
+                </div>
+            );
+
+            // Component render
+            return (
+                <div className="container mx-auto p-4 max-w-6xl">
+                    <h1 className="text-3xl font-bold text-center mb-8 text-gray-800">
+                        ⚡ Airtel AI - Live UPI Payments
+                    </h1>
+
+                    {/* Connection Status */}
+                    <div className="mb-6 flex items-center justify-between">
+                        <div className="flex items-center space-x-2">
+                            <div className={`w-3 h-3 rounded-full ${{
+                                'connected': 'bg-green-500 animate-pulse',
+                                'connecting': 'bg-yellow-500 animate-ping',
+                                'disconnected': 'bg-red-500',
+                                'error': 'bg-red-600'
+                            }[connectionStatus]}`}></div>
+                            <span className="text-sm font-medium">
+                                {connectionStatus.toUpperCase()}
+                            </span>
+                            <span className="text-xs text-green-600">
+                                • Live SSE • {clientId.current}
+                            </span>
+                        </div>
+                        
+                        <button 
+                            onClick={() => setIsDebugVisible(!isDebugVisible)}
+                            className="text-sm bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded transition-colors"
+                        >
+                            Debug {isDebugVisible ? 'ON' : 'OFF'}
+                        </button>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        {/* Setup Panel */}
+                        <div className="space-y-6">
+                            {/* MCP Servers */}
+                            <div className="bg-white rounded-lg shadow p-6">
+                                <h2 className="text-xl font-semibold mb-4">⚡ Live MCP Server</h2>
+                                <div className="space-y-4">
+                                    {mcpServers.map(server => (
+                                        <div key={server.id} className="flex items-center justify-between p-3 bg-green-50 rounded border-l-4 border-green-400">
+                                            <div>
+                                                <div className="font-medium text-green-800">{server.name}</div>
+                                                <div className="text-sm text-green-600">{server.url}</div>
+                                            </div>
+                                            <div className="text-green-600 animate-pulse">
+                                                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+                                                    <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                                                </svg>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            {/* Quick Actions */}
+                            <div className="bg-white rounded-lg shadow p-6">
+                                <h2 className="text-xl font-semibold mb-4">💡 Try These</h2>
+                                <div className="space-y-2">
+                                    <button
+                                        onClick={() => setInputValue('Recharge Rs 199')}
+                                        className="w-full text-left p-3 bg-green-50 rounded hover:bg-green-100 transition-colors border border-green-200"
+                                        type="button"
+                                    >
+                                        📱 "Recharge Rs 199"
+                                    </button>
+                                    <button
+                                        onClick={() => setInputValue('Top up Rs 99')}
+                                        className="w-full text-left p-3 bg-blue-50 rounded hover:bg-blue-100 transition-colors border border-blue-200"
+                                        type="button"
+                                    >
+                                        📱 "Top up Rs 99"
+                                    </button>
+                                    <button
+                                        onClick={() => setInputValue('Recharge Rs 299')}
+                                        className="w-full text-left p-3 bg-purple-50 rounded hover:bg-purple-100 transition-colors border border-purple-200"
+                                        type="button"
+                                    >
+                                        📱 "Recharge Rs 299"
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* Debug Logs */}
+                            {isDebugVisible && (
+                                <div className="bg-white rounded-lg shadow p-6">
+                                    <h2 className="text-xl font-semibold mb-4">Debug Logs</h2>
+                                    <div className="bg-black text-green-400 p-4 rounded-md h-64 overflow-y-auto text-sm font-mono">
+                                        {debugLogs.map(log => (
+                                            <div key={log.id} className="mb-1">
+                                                <span className={`font-bold ${{
+                                                    'INFO': 'text-blue-400',
+                                                    'SUCCESS': 'text-green-400',
+                                                    'ERROR': 'text-red-400',
+                                                    'DEBUG': 'text-yellow-400',
+                                                    'MCP': 'text-purple-400',
+                                                    'WARNING': 'text-orange-400',
+                                                    'PAYMENT': 'text-pink-400'
+                                                }[log.level] || 'text-gray-400'}`}>
+                                                    {log.level}
+                                                </span>
+                                                <span className="text-gray-400"> {log.timestamp}</span>
+                                                <span className="text-white"> {log.message}</span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Chat Panel */}
+                        <div className="bg-white rounded-lg shadow p-6">
+                            <h2 className="text-xl font-semibold mb-4">💬 Live Payment Chat</h2>
+                            
+                            {/* Messages */}
+                            <div className="h-96 overflow-y-auto border border-gray-200 rounded p-4 mb-4">
+                                {messages.length === 0 ? (
+                                    <div className="text-gray-500 text-center py-8">
+                                        <p className="text-lg">⚡ Welcome to Live UPI Payments!</p>
+                                        <p className="text-sm mt-2">Try: "Recharge Rs 199" - Payment buttons appear instantly via SSE!</p>
+                                    </div>
+                                ) : (
+                                    messages.map(message => (
+                                        <div key={message.id} className={`mb-4 ${{
+                                            'user': 'text-right',
+                                            'assistant': 'text-left',
+                                            'error': 'text-left',
+                                            'system': 'text-center'
+                                        }[message.type]}`}>
+                                            <div className={`inline-block max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${{
+                                                'user': 'bg-blue-500 text-white',
+                                                'assistant': message.pendingPayment ? 'bg-yellow-100 text-yellow-800 border border-yellow-300' : 'bg-gray-200 text-gray-800',
+                                                'error': 'bg-red-100 text-red-800 border border-red-300',
+                                                'system': 'bg-green-100 text-green-800 border border-green-300'
+                                            }[message.type]}`}>
+                                                <div className="whitespace-pre-wrap">{message.content}</div>
+                                                <div className={`text-xs mt-1 ${{
+                                                    'user': 'text-blue-100',
+                                                    'assistant': 'text-gray-500',
+                                                    'error': 'text-red-500',
+                                                    'system': 'text-green-500'
+                                                }[message.type]}`}>
+                                                    {message.timestamp}
+                                                    {message.pendingPayment && (
+                                                        <span className="ml-2 animate-pulse">⏳ Waiting for payment...</span>
+                                                    )}
+                                                </div>
+                                                
+                                                {/* Payment Button */}
+                                                {message.paymentButton && (
+                                                    <PaymentButton button={message.paymentButton} />
+                                                )}
+                                            </div>
+                                        </div>
+                                    ))
+                                )}
+                                {isLoading && (
+                                    <div className="text-left mb-4">
+                                        <div className="inline-block max-w-xs lg:max-w-md px-4 py-2 rounded-lg bg-blue-100 text-blue-800">
+                                            <div className="flex items-center space-x-2">
+                                                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600"></div>
+                                                <span>Initiating payment...</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Input Form */}
+                            <form onSubmit={handleSubmit} className="flex space-x-2">
+                                <input
+                                    type="text"
+                                    value={inputValue}
+                                    onChange={(e) => setInputValue(e.target.value)}
+                                    placeholder="Try: Recharge Rs 199"
+                                    disabled={isLoading}
+                                    className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
+                                />
+                                <button
+                                    type="submit"
+                                    disabled={isLoading || !inputValue.trim()}
+                                    className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
+                                >
+                                    {isLoading ? 'Sending...' : 'Send'}
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // Render the app
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+    
+    <!-- React and ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+</body>
+</html>
